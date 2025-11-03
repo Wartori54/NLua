@@ -91,7 +91,7 @@ namespace NLua.Method
             if (type == typeof(object))
                 return type.GetMethods(methodName, bindingType);
 
-            var methods = type.GetMethods(methodName, bindingType);
+            var methods = LuaMemberAttribute.GetMethodsForType(type, methodName, bindingType);
             var baseMethods = GetMethodsRecursively(type.BaseType, methodName, bindingType);
 
             return methods.Concat(baseMethods).ToArray();
@@ -104,7 +104,7 @@ namespace NLua.Method
         /// <param name="e">null for no pending exception</param>
         int SetPendingException(Exception e)
         {
-            return _translator.interpreter.SetPendingException(e);
+            return _translator.Interpreter?.SetPendingException(e) ?? 0;
         }
 
         void FillMethodArguments(LuaState luaState, int numStackToSkip)
@@ -175,8 +175,9 @@ namespace NLua.Method
             catch (TargetInvocationException e)
             {
                 // Failure of method invocation
-                if (_translator.interpreter.UseTraceback) 
-                    e.GetBaseException().Data["Traceback"] = _translator.interpreter.GetDebugTraceback();
+                Lua interpreter = _translator.Interpreter;
+                if (interpreter?.UseTraceback is true) 
+                    e.GetBaseException().Data["Traceback"] = interpreter.GetDebugTraceback();
                 return SetPendingException(e.GetBaseException());
             }
             catch (Exception e)
@@ -275,19 +276,45 @@ namespace NLua.Method
         int CallInvokeOnGenericMethod(LuaState luaState, MethodInfo methodToCall, object targetObject)
         {
             //need to make a concrete type of the generic method definition
-            var typeArgs = new List<Type>();
+            Dictionary<string, Type> genericParameterNames = new Dictionary<string, Type>();
 
-            ParameterInfo [] parameters = methodToCall.GetParameters();
-
+            ParameterInfo[] parameters = methodToCall.GetParameters();
             for (int i = 0; i < parameters.Length; i++)
             {
                 ParameterInfo parameter = parameters[i];
 
-                if (!parameter.ParameterType.IsGenericParameter)
-                    continue;
+                if (parameter.ParameterType.IsGenericType)
+                {
+                    var currentArg = _lastCalledMethod.args[i];
+                    var currentArgType = currentArg.GetType();
+                    var genericArgTypeArguments = currentArgType.GenericTypeArguments;
 
-                typeArgs.Add(_lastCalledMethod.args[i].GetType());
+                    //if currentArgType is array, use element type to be generic arguments for compatibility IEnumerable.
+                    if (currentArgType.IsArray)
+                    {
+                        genericArgTypeArguments = new Type[] { currentArgType.GetElementType() };
+                    }
+
+                    var genericTypeArguments = parameter.ParameterType.GenericTypeArguments;
+                    for (int j = 0; j < genericTypeArguments.Length; j++)
+                    {
+                        var arg = genericTypeArguments[j];
+                        if (arg.IsGenericParameter && !genericParameterNames.ContainsKey(arg.Name))
+                        {
+                            genericParameterNames.Add(arg.Name, genericArgTypeArguments[j]);
+                        }
+                    }
+                }
+
+                if (parameter.ParameterType.IsGenericParameter)
+                {
+                    genericParameterNames.Add(parameter.ParameterType.Name, _lastCalledMethod.args[i].GetType());
+                }
             }
+
+            //Map Name/Type to generic arguments types
+            var methodGenericArguments = methodToCall.GetGenericArguments();
+            var typeArgs = methodGenericArguments.Select(item => genericParameterNames[item.Name]);
 
             MethodInfo concreteMethod = methodToCall.MakeGenericMethod(typeArgs.ToArray());
             var result = concreteMethod.Invoke(targetObject, _lastCalledMethod.args);
